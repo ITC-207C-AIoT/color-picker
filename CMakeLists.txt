@@ -11,7 +11,7 @@ if(OpenCV_VERSION VERSION_LESS 4 OR NOT OpenCV_VERSION VERSION_LESS 6)
     message(FATAL_ERROR "This project supports OpenCV 4 and 5")
 endif()
 
-add_library(hsv_picker_core src/hsv_picker.cpp)
+add_library(hsv_picker_core src/hsv_picker.cpp src/screenshot.cpp)
 target_include_directories(hsv_picker_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(hsv_picker_core PUBLIC ${OpenCV_LIBS})
 target_compile_options(hsv_picker_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -23,6 +23,19 @@ target_compile_options(hsv-picker PRIVATE -Wall -Wextra -Wpedantic)
 # This API is absent in older OpenCV 4 releases. Detect it instead of requiring it.
 include(CheckCXXSourceCompiles)
 set(CMAKE_REQUIRED_INCLUDES ${OpenCV_INCLUDE_DIRS})
+set(CMAKE_REQUIRED_LIBRARIES ${OpenCV_LIBS})
+# GCC 8 and older may need an explicit filesystem library on the target host.
+check_cxx_source_compiles("#include <filesystem>
+int main() { return std::filesystem::current_path().empty(); }" HSV_HAS_FILESYSTEM)
+if(NOT HSV_HAS_FILESYSTEM)
+    set(CMAKE_REQUIRED_LIBRARIES ${OpenCV_LIBS} stdc++fs)
+    check_cxx_source_compiles("#include <filesystem>
+int main() { return std::filesystem::current_path().empty(); }" HSV_HAS_FILESYSTEM_LIBRARY)
+    if(NOT HSV_HAS_FILESYSTEM_LIBRARY)
+        message(FATAL_ERROR "The compiler must provide C++17 std::filesystem")
+    endif()
+    target_link_libraries(hsv_picker_core PUBLIC stdc++fs)
+endif()
 set(CMAKE_REQUIRED_LIBRARIES ${OpenCV_LIBS})
 check_cxx_source_compiles("#include <opencv2/highgui.hpp>
 int main() { return cv::currentUIFramework().empty(); }" HSV_HAS_UI_FRAMEWORK)

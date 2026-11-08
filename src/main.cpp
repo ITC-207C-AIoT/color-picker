@@ -1,4 +1,5 @@
 #include "hsv_picker.hpp"
+#include "screenshot.hpp"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -22,13 +23,17 @@ void printSelection(const hsvpicker::Picker& picker) {
     }
     const auto& stats = *picker.statistics();
     const auto& roi = picker.selection();
-    std::cout << "ROI: x=" << roi.x << " y=" << roi.y << " w=" << roi.width
+    const bool lab = stats.colorSpace == hsvpicker::ColorSpace::Lab;
+    std::cout << "Color space: " << hsvpicker::colorSpaceName(stats.colorSpace) << '\n'
+              << "ROI: x=" << roi.x << " y=" << roi.y << " w=" << roi.width
               << " h=" << roi.height << " pixels=" << stats.pixels << '\n'
-              << "[hbegin, hend, sbegin, send, vbegin, vend] = "
+              << hsvpicker::rangeLabel(stats.colorSpace) << " = "
               << hsvpicker::rangeText(stats) << '\n'
               << "const cv::Scalar lower = " << hsvpicker::scalarText(stats, false) << ";\n"
               << "const cv::Scalar upper = " << hsvpicker::scalarText(stats, true) << ";\n"
-              << "cv::inRange(hsv, lower, upper, mask);\n" << std::flush;
+              << "cv::cvtColor(bgr, " << (lab ? "lab" : "hsv") << ", cv::"
+              << (lab ? "COLOR_BGR2Lab" : "COLOR_BGR2HSV") << ");\n"
+              << "cv::inRange(" << (lab ? "lab" : "hsv") << ", lower, upper, mask);\n" << std::flush;
 }
 
 class WindowMonitor {
@@ -84,14 +89,17 @@ int main(int argc, char** argv) {
         }
         const auto options = hsvpicker::parseOptions(arguments);
         if (options.help) {
-            std::cout << "Usage: hsv-picker [--source DEVICE_OR_IMAGE]\n"
+            std::cout << "Usage: hsv-picker [--source DEVICE_OR_IMAGE] [--screenshot-dir DIR]\n"
                       << "Default source: /dev/video0\n"
+                      << "Default screenshot directory: ./screenshots (PNG, full original BGR frame)\n"
                       << "Examples:\n"
                       << "  hsv-picker --source /dev/video2\n"
                       << "  hsv-picker --source ./image.png\n"
                       << "Controls: drag left mouse to select; Space freezes/resumes camera;\n"
+                      << "          Shift switches HSV/Lab; S saves a screenshot;\n"
                       << "          R clears/resumes; P prints OpenCV bounds; Q/Esc quits.\n"
-                      << "HSV units: COLOR_BGR2HSV, H 0..179, S/V 0..255.\n";
+                      << "Default space: HSV (H 0..179, S/V 0..255).\n"
+                      << "Lab units: COLOR_BGR2Lab, 8-bit L/a/b 0..255, neutral a/b = 128.\n";
             return EXIT_SUCCESS;
         }
 
@@ -135,16 +143,27 @@ int main(int argc, char** argv) {
 #endif
         WindowMonitor windowMonitor(checkProperties);
         std::cout << "Drag left mouse to select. Camera freezes during dragging and resumes on release.\n"
-                  << "Bounds use H 0..179 and S/V 0..255; release the mouse or press P to print.\n"
+                  << "Shift: HSV/Lab; S: save original frame to " << options.screenshotDir << '\n'
+                  << "Release the mouse or press P to print OpenCV 8-bit bounds.\n"
                   << std::flush;
         while (true) {
             cv::imshow(windowName, picker.render());
-            const int key = cv::waitKey(20);
-            if (!windowMonitor.isOpen() || !picker.onKey(key < 0 ? key : key & 0xff)) {
+            const int key = cv::waitKeyEx(20);
+            if (!windowMonitor.isOpen() || !picker.onKey(key)) {
                 break;
             }
             if (picker.takeReportRequest()) {
                 printSelection(picker);
+            }
+            if (auto screenshot = picker.takeScreenshotRequest()) {
+                const auto result = hsvpicker::saveScreenshot(*screenshot, options.screenshotDir);
+                if (result) {
+                    std::cout << "Screenshot saved: " << result.path << '\n' << std::flush;
+                    picker.setNotice("Screenshot saved. Full path is printed in the terminal.");
+                } else {
+                    std::cerr << "Screenshot failed: " << result.error << '\n';
+                    picker.setNotice("Screenshot failed. See terminal for details.", true);
+                }
             }
             // Read after processing events, so a drag samples the frame just displayed.
             if (camera && !picker.frozen()) {

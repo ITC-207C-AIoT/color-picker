@@ -17,19 +17,46 @@ const cv::Scalar muted(168, 164, 157);
 const cv::Scalar accent(126, 220, 108);
 const cv::Rect viewport(16, 88, 720, 570);
 
+struct HistogramLayout {
+    int top;
+    cv::Rect plot; // Includes the baseline; bars occupy the rows above it.
+};
+
+HistogramLayout histogramLayout(int channel) {
+    const int top = 259 + channel * 127;
+    return {top, cv::Rect(766, top + 26, 390, 75)};
+}
+
+int histogramBins(ColorSpace space, int channel) {
+    return space == ColorSpace::Hsv && channel == 0 ? 180 : 256;
+}
+
+int histogramValueAtX(const cv::Rect& plot, int bins, int x) {
+    const int offset = std::clamp(x - plot.x, 0, plot.width - 1);
+    // Inverse of bar edges floor(bin * width / bins). Using floor(x*bins/width)
+    // would report the preceding bin at some boundaries with unequal bar widths.
+    return ((offset + 1) * bins - 1) / plot.width;
+}
+
 void text(cv::Mat& canvas, const std::string& value, int x, int y,
           double scale = 0.48, cv::Scalar color = ink) {
     cv::putText(canvas, value, cv::Point(x, y), cv::FONT_HERSHEY_SIMPLEX,
                 scale, color, 1, cv::LINE_AA);
 }
 
-void histogram(cv::Mat& canvas, const HsvStatistics* stats, int channel, int top) {
-    const int left = 766;
-    const int width = 390;
-    const int height = 74;
-    const int bottom = top + 100;
-    const char* names[] = {"H / Hue", "S / Saturation", "V / Value"};
-    const int bins = channel == 0 ? 180 : 256;
+void histogram(cv::Mat& canvas, const ColorStatistics* stats, ColorSpace space,
+               int channel) {
+    const auto layout = histogramLayout(channel);
+    const int top = layout.top;
+    const auto& plot = layout.plot;
+    const int left = plot.x;
+    const int width = plot.width;
+    const int height = plot.height - 1;
+    const int bottom = plot.y + height;
+    const char* hsvNames[] = {"H / Hue", "S / Saturation", "V / Value"};
+    const char* labNames[] = {"L / Lightness", "a / Green - Red", "b / Blue - Yellow"};
+    const auto* names = space == ColorSpace::Hsv ? hsvNames : labNames;
+    const int bins = histogramBins(space, channel);
     const cv::Scalar colors[] = {cv::Scalar(110, 185, 230),
                                  cv::Scalar(215, 160, 110),
                                  cv::Scalar(130, 220, 140)};
@@ -47,7 +74,7 @@ void histogram(cv::Mat& canvas, const HsvStatistics* stats, int channel, int top
             const int x1 = left + bin * width / bins;
             const int x2 = left + (bin + 1) * width / bins - 1;
             cv::Scalar color = colors[channel];
-            if (channel == 0) {
+            if (space == ColorSpace::Hsv && channel == 0) {
                 cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(bin, 220, 240));
                 cv::Mat bgr;
                 cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
@@ -59,14 +86,82 @@ void histogram(cv::Mat& canvas, const HsvStatistics* stats, int channel, int top
         }
     }
     text(canvas, "peak count: " + std::to_string(peak), left + 188, top + 14, 0.40, muted);
-    cv::line(canvas, {left, bottom}, {left + width, bottom}, muted);
-    text(canvas, "0", left, bottom + 17, 0.40, muted);
-    text(canvas, std::to_string((bins - 1) / 2), left + width / 2 - 12,
-         bottom + 17, 0.40, muted);
-    text(canvas, std::to_string(bins - 1), left + width - 26,
-         bottom + 17, 0.40, muted);
+    cv::line(canvas, {left, bottom}, {left + width - 1, bottom}, muted);
+    for (int tick : {left, left + width / 2, left + width - 1}) {
+        const std::string label = std::to_string(histogramValueAtX(plot, bins, tick));
+        int baseline = 0;
+        const auto size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.40, 1, &baseline);
+        const int x = std::clamp(tick - size.width / 2, left, left + width - size.width);
+        text(canvas, label, x, bottom + 17, 0.40, muted);
+    }
+}
+
+void histogramTooltip(cv::Mat& canvas, const HistogramHover& hover, ColorSpace space) {
+    const auto plot = histogramLayout(hover.channel).plot;
+    cv::line(canvas, {hover.position.x, plot.y},
+             {hover.position.x, plot.y + plot.height - 1}, accent);
+
+    const char* hsvNames[] = {"H", "S", "V"};
+    const char* labNames[] = {"L", "a", "b"};
+    const auto* names = space == ColorSpace::Hsv ? hsvNames : labNames;
+    const std::string label = std::string(names[hover.channel]) + " = " + std::to_string(hover.value);
+    constexpr int padding = 6;
+    constexpr int gap = 12;
+    constexpr int margin = 2;
+    constexpr double scale = 0.48;
+    int baseline = 0;
+    const auto size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline);
+    const int width = size.width + padding * 2;
+    const int height = size.height + baseline + padding * 2;
+    int x = hover.position.x + gap;
+    int y = hover.position.y + gap;
+    if (x + width > plot.br().x - margin) {
+        x = hover.position.x - gap - width;
+    }
+    if (y + height > plot.br().y - margin) {
+        y = hover.position.y - gap - height;
+    }
+    x = std::clamp(x, plot.x + margin, plot.br().x - width - margin);
+    y = std::clamp(y, plot.y + margin, plot.br().y - height - margin);
+    const cv::Rect box(x, y, width, height);
+    cv::rectangle(canvas, box, background, cv::FILLED);
+    cv::rectangle(canvas, box, accent);
+    text(canvas, label, x + padding, y + padding + size.height, scale);
 }
 } // namespace
+
+const char* colorSpaceName(ColorSpace space) {
+    return space == ColorSpace::Hsv ? "HSV" : "Lab";
+}
+
+const char* rangeLabel(ColorSpace space) {
+    return space == ColorSpace::Hsv ? "[hbegin,hend,sbegin,send,vbegin,vend]" :
+                                     "[lbegin,lend,abegin,aend,bbegin,bend]";
+}
+
+int conversionCode(ColorSpace space) {
+    return space == ColorSpace::Hsv ? cv::COLOR_BGR2HSV : cv::COLOR_BGR2Lab;
+}
+
+KeyAction decodeKey(int key) {
+    if (key == -1) {
+        return KeyAction::None;
+    }
+    // GTK packs modifier state into the upper 16 bits. Qt on Linux normally
+    // uses the same X11 keysyms; also accept the Qt Shift key enum explicitly.
+    const unsigned symbol = static_cast<unsigned>(key) & 0xffffU;
+    if (key == 0x01000020 || symbol == 0xffe1 || symbol == 0xffe2) {
+        return KeyAction::SwitchColorSpace;
+    }
+    switch (symbol) {
+    case 27: case 'q': case 'Q': return KeyAction::Quit;
+    case ' ': return KeyAction::Pause;
+    case 'r': case 'R': return KeyAction::Clear;
+    case 'p': case 'P': return KeyAction::Print;
+    case 's': case 'S': return KeyAction::Screenshot;
+    default: return KeyAction::None;
+    }
+}
 
 Options parseOptions(const std::vector<std::string>& arguments) {
     Options options;
@@ -85,6 +180,17 @@ Options parseOptions(const std::vector<std::string>& arguments) {
             if (options.source.empty()) {
                 throw std::invalid_argument("--source must not be empty");
             }
+        } else if (arg == "--screenshot-dir") {
+            if (i + 1 == arguments.size() || arguments[i + 1].empty() ||
+                arguments[i + 1].rfind("--", 0) == 0) {
+                throw std::invalid_argument("--screenshot-dir requires a directory path");
+            }
+            options.screenshotDir = arguments[++i];
+        } else if (arg.rfind("--screenshot-dir=", 0) == 0) {
+            options.screenshotDir = arg.substr(17);
+            if (options.screenshotDir.empty()) {
+                throw std::invalid_argument("--screenshot-dir must not be empty");
+            }
         } else {
             throw std::invalid_argument("Unknown argument: " + arg);
         }
@@ -96,24 +202,26 @@ bool isCameraSource(const std::string& source) {
     return source.rfind("/dev/video", 0) == 0 || source.rfind("/dev/v4l/", 0) == 0;
 }
 
-HsvStatistics analyze(const cv::Mat& bgr, const cv::Rect& roi) {
+ColorStatistics analyze(const cv::Mat& bgr, const cv::Rect& roi, ColorSpace colorSpace) {
     if (bgr.empty() || bgr.type() != CV_8UC3) {
-        throw std::invalid_argument("HSV analysis requires a nonempty 8-bit BGR image");
+        throw std::invalid_argument("Color analysis requires a nonempty 8-bit BGR image");
     }
     if (roi.empty() || (roi & cv::Rect(0, 0, bgr.cols, bgr.rows)) != roi) {
         throw std::invalid_argument("Selection is empty or outside the image");
     }
-    cv::Mat hsv;
-    cv::cvtColor(bgr(roi), hsv, cv::COLOR_BGR2HSV);
-    HsvStatistics result;
-    result.range = {179, 0, 255, 0, 255, 0};
-    result.histograms = {std::vector<std::uint64_t>(180),
+    cv::Mat converted;
+    cv::cvtColor(bgr(roi), converted, conversionCode(colorSpace));
+    ColorStatistics result;
+    result.colorSpace = colorSpace;
+    const int firstBins = colorSpace == ColorSpace::Hsv ? 180 : 256;
+    result.range = {firstBins - 1, 0, 255, 0, 255, 0};
+    result.histograms = {std::vector<std::uint64_t>(firstBins),
                          std::vector<std::uint64_t>(256),
                          std::vector<std::uint64_t>(256)};
     result.pixels = static_cast<std::uint64_t>(roi.width) * roi.height;
-    for (int y = 0; y < hsv.rows; ++y) {
-        const auto* row = hsv.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < hsv.cols; ++x) {
+    for (int y = 0; y < converted.rows; ++y) {
+        const auto* row = converted.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < converted.cols; ++x) {
             for (int channel = 0; channel < 3; ++channel) {
                 const int value = row[x][channel];
                 ++result.histograms[channel][value];
@@ -125,7 +233,7 @@ HsvStatistics analyze(const cv::Mat& bgr, const cv::Rect& roi) {
     return result;
 }
 
-std::string rangeText(const HsvStatistics& statistics) {
+std::string rangeText(const ColorStatistics& statistics) {
     std::string result = "[";
     for (std::size_t i = 0; i < statistics.range.size(); ++i) {
         result += (i == 0 ? "" : ", ") + std::to_string(statistics.range[i]);
@@ -133,7 +241,7 @@ std::string rangeText(const HsvStatistics& statistics) {
     return result + "]";
 }
 
-std::string scalarText(const HsvStatistics& statistics, bool upper) {
+std::string scalarText(const ColorStatistics& statistics, bool upper) {
     const auto& r = statistics.range;
     const int offset = upper ? 1 : 0;
     return "cv::Scalar(" + std::to_string(r[offset]) + ", " +
@@ -193,7 +301,7 @@ void Picker::refreshStatistics() {
     if (selection_.empty()) {
         statistics_.reset();
     } else {
-        statistics_ = analyze(frame_, selection_);
+        statistics_ = analyze(frame_, selection_, colorSpace_);
     }
 }
 
@@ -203,10 +311,11 @@ void Picker::selectTo(cv::Point point) {
 }
 
 void Picker::onMouse(int event, int x, int y, int /*flags*/) {
+    const cv::Point point(x, y);
+    mousePosition_ = point;
     if (frame_.empty()) {
         return;
     }
-    const cv::Point point(x, y);
     if (event == cv::EVENT_LBUTTONDOWN && imageRect_.contains(point)) {
         anchor_ = point;
         dragging_ = true;
@@ -222,19 +331,39 @@ void Picker::onMouse(int event, int x, int y, int /*flags*/) {
     }
 }
 
+std::optional<HistogramHover> Picker::histogramHover() const {
+    if (dragging_ || !mousePosition_) {
+        return std::nullopt;
+    }
+    for (int channel = 0; channel < 3; ++channel) {
+        const auto plot = histogramLayout(channel).plot;
+        if (plot.contains(*mousePosition_)) {
+            return HistogramHover{channel, histogramValueAtX(plot, histogramBins(colorSpace_, channel),
+                                                           mousePosition_->x), *mousePosition_};
+        }
+    }
+    return std::nullopt;
+}
+
 bool Picker::onKey(int key) {
-    if (key == 27 || key == 'q' || key == 'Q') {
+    const auto action = decodeKey(key);
+    if (action == KeyAction::Quit) {
         return false;
     }
-    if (key == ' ' && camera_ && !dragging_) {
+    if (action == KeyAction::SwitchColorSpace) {
+        colorSpace_ = colorSpace_ == ColorSpace::Hsv ? ColorSpace::Lab : ColorSpace::Hsv;
+        refreshStatistics();
+    } else if (action == KeyAction::Screenshot && !frame_.empty()) {
+        screenshotRequest_ = frame_.clone();
+    } else if (action == KeyAction::Pause && camera_ && !dragging_) {
         paused_ = !paused_;
-    } else if (key == 'r' || key == 'R') {
+    } else if (action == KeyAction::Clear) {
         dragging_ = false;
         paused_ = false;
         selection_ = {};
         statistics_.reset();
         reportRequested_ = false;
-    } else if ((key == 'p' || key == 'P') && statistics_) {
+    } else if (action == KeyAction::Print && statistics_) {
         reportRequested_ = true;
     }
     return true;
@@ -246,12 +375,29 @@ bool Picker::takeReportRequest() {
     return result;
 }
 
+std::optional<cv::Mat> Picker::takeScreenshotRequest() {
+    auto result = std::move(screenshotRequest_);
+    screenshotRequest_.reset();
+    return result;
+}
+
+void Picker::setNotice(const std::string& message, bool error) {
+    notice_ = message;
+    noticeError_ = error;
+    noticeUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+}
+
 cv::Mat Picker::render() const {
     cv::Mat canvas(canvasHeight, canvasWidth, CV_8UC3, background);
-    text(canvas, "HSV PICKER", 16, 32, 0.82, accent);
+    text(canvas, std::string(colorSpaceName(colorSpace_)) + " PICKER", 16, 32, 0.82, accent);
     const std::string status = camera_ ? (frozen() ? "CAMERA / FROZEN" : "CAMERA / LIVE") : "IMAGE";
     text(canvas, status, 560, 32, 0.48, accent);
-    text(canvas, "Drag left mouse to select. Values use OpenCV 8-bit HSV.", 16, 61, 0.48, muted);
+    if (std::chrono::steady_clock::now() < noticeUntil_) {
+        text(canvas, notice_, 16, 61, 0.48, noticeError_ ? cv::Scalar(100, 100, 255) : accent);
+    } else {
+        text(canvas, "Drag left mouse to select. Values use OpenCV 8-bit " +
+             std::string(colorSpaceName(colorSpace_)) + ".", 16, 61, 0.48, muted);
+    }
     cv::rectangle(canvas, viewport, panel, cv::FILLED);
     cv::rectangle(canvas, cv::Rect(750, 88, 414, 570), panel, cv::FILLED);
 
@@ -276,15 +422,19 @@ cv::Mat Picker::render() const {
         }
     }
 
-    text(canvas, "[hbegin,hend,sbegin,send,vbegin,vend]", 766, 112, 0.43, muted);
+    text(canvas, rangeLabel(colorSpace_), 766, 112, 0.43, muted);
     const auto* stats = statistics_ ? &*statistics_ : nullptr;
     text(canvas, stats ? rangeText(*stats) : "Select an image region", 766, 141, 0.64, accent);
-    text(canvas, "Inclusive min / max. H: 0..179, S/V: 0..255", 766, 164, 0.40, muted);
+    text(canvas, colorSpace_ == ColorSpace::Hsv ? "Inclusive min / max. H: 0..179, S/V: 0..255" :
+         "Inclusive min / max. L/a/b: 0..255 (8-bit)", 766, 164, 0.40, muted);
     text(canvas, stats ? "lower = " + scalarText(*stats, false) : "lower = --", 766, 190, 0.46);
     text(canvas, stats ? "upper = " + scalarText(*stats, true) : "upper = --", 766, 214, 0.46);
-    text(canvas, "Histograms: x = HSV value, y = pixel count", 766, 244, 0.41, muted);
+    text(canvas, "Histograms: x = value (hover), y = pixel count", 766, 244, 0.41, muted);
     for (int channel = 0; channel < 3; ++channel) {
-        histogram(canvas, stats, channel, 259 + channel * 127);
+        histogram(canvas, stats, colorSpace_, channel);
+    }
+    if (const auto hover = histogramHover()) {
+        histogramTooltip(canvas, *hover, colorSpace_);
     }
 
     if (stats) {
@@ -294,8 +444,8 @@ cv::Mat Picker::render() const {
     } else {
         text(canvas, "No selection | Statistics are computed from original pixels.", 16, 681, 0.45, muted);
     }
-    text(canvas, "Space: freeze/resume camera   R: clear/resume   P: print bounds   Q / Esc: quit",
-         16, 706, 0.46, muted);
+    text(canvas, "Shift: HSV/Lab   S: screenshot   Space: freeze/resume   R: clear/resume   P: print   Q/Esc: quit",
+         16, 706, 0.44, muted);
     return canvas;
 }
 

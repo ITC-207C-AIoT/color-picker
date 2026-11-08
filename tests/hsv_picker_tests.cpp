@@ -1,9 +1,13 @@
 #include "hsv_picker.hpp"
+#include "screenshot.hpp"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <numeric>
@@ -30,6 +34,14 @@ void testOptions() {
     require(hsvpicker::parseOptions({"--source", "/dev/video2"}).source == "/dev/video2", "Camera option");
     require(hsvpicker::parseOptions({"--source=some image.png"}).source == "some image.png", "Image option");
     require(hsvpicker::parseOptions({"--help"}).help, "Help option");
+    require(hsvpicker::parseOptions({}).screenshotDir == "./screenshots", "Default screenshot directory");
+    require(hsvpicker::parseOptions({"--screenshot-dir", "my shots"}).screenshotDir == "my shots",
+            "Screenshot directory with spaces");
+    require(hsvpicker::parseOptions({"--screenshot-dir=/tmp/shots"}).screenshotDir == "/tmp/shots",
+            "Screenshot directory equals syntax");
+    requiresInvalidArgument([] { hsvpicker::parseOptions({"--screenshot-dir"}); });
+    requiresInvalidArgument([] { hsvpicker::parseOptions({"--screenshot-dir="}); });
+    requiresInvalidArgument([] { hsvpicker::parseOptions({"--screenshot-dir", "--help"}); });
     require(hsvpicker::isCameraSource("/dev/video0"), "Video source detection");
     require(hsvpicker::isCameraSource("/dev/v4l/by-id/camera"), "Stable camera symlink detection");
     require(!hsvpicker::isCameraSource("photo.png"), "Image source detection");
@@ -106,6 +118,250 @@ void testCoordinates() {
     const auto sample = hsvpicker::sourceSelection(enlarged.tl(), enlarged.tl(), enlarged, cv::Size(2, 1));
     require(sample == cv::Rect(0, 0, 1, 1), "Upscaled pixel maps to a valid original pixel");
     requiresInvalidArgument([&] { hsvpicker::fitImage(cv::Size(), viewport); });
+}
+
+bool sameImage(const cv::Mat& a, const cv::Mat& b) {
+    return !a.empty() && !b.empty() && a.size() == b.size() && a.type() == b.type() &&
+           cv::norm(a, b, cv::NORM_INF) == 0;
+}
+
+void testHistogramHover() {
+    using hsvpicker::ColorSpace;
+    hsvpicker::Picker picker(true);
+    const cv::Mat image(120, 200, CV_8UC3, cv::Scalar(0, 255, 0));
+    picker.setFrame(image);
+    require(!picker.histogramHover(), "No hover before receiving a mouse position");
+    for (const auto space : {ColorSpace::Hsv, ColorSpace::Lab}) {
+        if (picker.colorSpace() != space) picker.onKey(0xffe1);
+        for (int channel = 0; channel < 3; ++channel) {
+            const cv::Rect plot(766, 285 + channel * 127, 390, 75);
+            const int bins = space == ColorSpace::Hsv && channel == 0 ? 180 : 256;
+            for (int value = 0; value < bins; ++value) {
+                const int first = plot.x + value * plot.width / bins;
+                const int last = plot.x + (value + 1) * plot.width / bins - 1;
+                for (const auto point : {cv::Point(first, plot.y), cv::Point(last, plot.br().y - 1)}) {
+                    picker.onMouse(cv::EVENT_MOUSEMOVE, point.x, point.y, 0);
+                    const auto hover = picker.histogramHover();
+                    require(hover && hover->channel == channel && hover->value == value &&
+                            hover->position == point, "Hover matches each rendered bar including its edge pixels");
+                }
+            }
+            for (const auto point : {plot.tl(), plot.br() - cv::Point(1, 1),
+                                    cv::Point(plot.x, plot.br().y - 1), cv::Point(plot.br().x - 1, plot.y)}) {
+                picker.onMouse(cv::EVENT_MOUSEMOVE, 0, 0, 0);
+                const auto without = picker.render();
+                picker.onMouse(cv::EVENT_MOUSEMOVE, point.x, point.y, 0);
+                const auto with = picker.render();
+                cv::Mat difference;
+                cv::absdiff(without, with, difference);
+                cv::Mat outside(with.size(), CV_8UC1, cv::Scalar(255));
+                outside(plot).setTo(0);
+                require(cv::norm(difference, cv::NORM_INF) > 0 &&
+                        cv::norm(difference, cv::NORM_INF, outside) == 0,
+                        "Tooltip and guide stay inside this plot at all four corners");
+                require(with.at<cv::Vec3b>(plot.y, point.x) != without.at<cv::Vec3b>(plot.y, point.x) &&
+                        with.at<cv::Vec3b>(plot.br().y - 1, point.x) !=
+                        without.at<cv::Vec3b>(plot.br().y - 1, point.x),
+                        "Vertical guide reaches the plot top and baseline");
+            }
+        }
+    }
+    require(!picker.statistics() && picker.selection().empty() && !picker.frozen() &&
+            !picker.takeReportRequest() && !picker.takeScreenshotRequest(),
+            "Hover works without ROI statistics and does not change camera or report state");
+    for (const auto point : {cv::Point(765, 300), cv::Point(1156, 300), cv::Point(961, 284),
+                            cv::Point(961, 360), cv::Point(-1, -1), cv::Point(2000, 1000)}) {
+        picker.onMouse(cv::EVENT_MOUSEMOVE, point.x, point.y, 0);
+        require(!picker.histogramHover(), "Moving outside a plot hides its hover");
+    }
+    picker.onMouse(cv::EVENT_MOUSEMOVE, 961, 300, 0);
+    require(picker.histogramHover()->value == 128, "Lab midpoint is encoded value 128");
+    picker.onKey(0xffe1);
+    require(picker.histogramHover()->channel == 0 && picker.histogramHover()->value == 90,
+            "Shift updates hover at a stationary pointer immediately");
+
+    const auto display = picker.imageRect();
+    picker.onMouse(cv::EVENT_LBUTTONDOWN, display.x + 10, display.y + 10, 0);
+    picker.onMouse(cv::EVENT_MOUSEMOVE, 961, 300, 0);
+    require(picker.frozen() && !picker.histogramHover(), "Dragging across a plot does not display a tooltip");
+    picker.onMouse(cv::EVENT_LBUTTONUP, 961, 300, 0);
+    require(picker.takeReportRequest() && picker.histogramHover() && !picker.frozen(),
+            "Release ends dragging normally and re-enables hover");
+    const auto selection = picker.selection();
+    const auto range = picker.statistics()->range;
+    picker.onMouse(cv::EVENT_MOUSEMOVE, 1155, 613, 0);
+    require(picker.selection() == selection && picker.statistics()->range == range &&
+            !picker.takeReportRequest() && !picker.frozen(), "Hover preserves a completed ROI and its statistics");
+    picker.onKey('s');
+    const auto screenshot = picker.takeScreenshotRequest();
+    require(screenshot && sameImage(*screenshot, image), "Hover overlay is not included in original-frame screenshots");
+    picker.setFrame(cv::Mat(image.size(), CV_8UC3, cv::Scalar(0, 0, 255)));
+    require(picker.histogramHover()->value == 255 && picker.statistics()->range[0] == 0 && !picker.frozen(),
+            "Camera frames and selected ROI continue updating while hovering");
+    picker.onKey(' ');
+    picker.onMouse(cv::EVENT_MOUSEMOVE, 961, 300, 0);
+    require(picker.frozen() && picker.histogramHover(), "Hover preserves a manual camera pause");
+}
+
+void testLabStatistics() {
+    using hsvpicker::ColorSpace;
+    cv::Mat image(4, 5, CV_8UC3, cv::Scalar(0, 255, 0));
+    const cv::Rect roi(1, 1, 2, 2);
+    image(roi).setTo(cv::Scalar(0, 0, 0));
+    image.at<cv::Vec3b>(1, 2) = {255, 255, 255};
+    image.at<cv::Vec3b>(2, 1) = {255, 255, 255};
+    const auto stats = hsvpicker::analyze(image, roi, ColorSpace::Lab);
+    require(stats.colorSpace == ColorSpace::Lab && stats.pixels == 4, "Lab mode and pixel count");
+    require(stats.range == std::array<int, 6>{0, 255, 128, 128, 128, 128},
+            "8-bit Lab encodes black, white, and neutral chroma directly");
+    for (const auto& bins : stats.histograms) {
+        require(bins.size() == 256 && std::accumulate(bins.begin(), bins.end(), std::uint64_t{0}) == 4,
+                "Every Lab histogram has 256 bins and counts every ROI pixel");
+    }
+    require(stats.histograms[0][0] == 2 && stats.histograms[0][255] == 2 &&
+            stats.histograms[1][128] == 4 && stats.histograms[2][128] == 4,
+            "Lab frequencies include endpoint bins and exclude the green border");
+    require(hsvpicker::scalarText(stats, false) == "cv::Scalar(0, 128, 128)" &&
+            hsvpicker::scalarText(stats, true) == "cv::Scalar(255, 128, 128)",
+            "Lab output preserves L/a/b channel order");
+    require(std::string(hsvpicker::rangeLabel(ColorSpace::Lab)) ==
+            "[lbegin,lend,abegin,aend,bbegin,bend]", "Lab range labels");
+    cv::Mat lab, mask;
+    cv::cvtColor(image(roi), lab, cv::COLOR_BGR2Lab);
+    const auto& r = stats.range;
+    cv::inRange(lab, cv::Scalar(r[0], r[2], r[4]), cv::Scalar(r[1], r[3], r[5]), mask);
+    require(cv::countNonZero(mask) == 4, "Lab bounds are directly usable by inRange");
+
+    const auto red = hsvpicker::analyze(cv::Mat(1, 1, CV_8UC3, cv::Scalar(0, 0, 255)),
+                                      cv::Rect(0, 0, 1, 1), ColorSpace::Lab);
+    const std::array<int, 3> reference{136, 208, 195};
+    for (int channel = 0; channel < 3; ++channel) {
+        require(std::abs(red.range[channel * 2] - reference[channel]) <= 1 &&
+                red.range[channel * 2] == red.range[channel * 2 + 1],
+                "Known red has encoded Lab values, with conversion rounding tolerance");
+    }
+}
+
+void testFullKeyCodes() {
+    using hsvpicker::KeyAction;
+    for (const int key : {0xffe1, 0xffe2, 0x0001ffe1, 0x0010ffe2, 0x01000020}) {
+        require(hsvpicker::decodeKey(key) == KeyAction::SwitchColorSpace, "Left/right Shift key codes");
+    }
+    for (const int key : std::array<int, 3>{'s', 'S', 0x01010073}) {
+        require(hsvpicker::decodeKey(key) == KeyAction::Screenshot, "S and GTK modifier state");
+    }
+    for (const int key : {-1, 0, 0xff50, 0xff53, 0xffe3}) {
+        require(hsvpicker::decodeKey(key) == KeyAction::None,
+                "Special keys are not confused with ASCII by low-eight-bit truncation");
+    }
+    require(hsvpicker::decodeKey(0x00100070) == KeyAction::Print &&
+            hsvpicker::decodeKey(0x00010052) == KeyAction::Clear &&
+            hsvpicker::decodeKey(' ') == KeyAction::Pause &&
+            hsvpicker::decodeKey(27) == KeyAction::Quit, "Existing keyboard shortcuts");
+}
+
+void testSwitchingAndScreenshots() {
+    using hsvpicker::ColorSpace;
+    for (const bool camera : {false, true}) {
+        hsvpicker::Picker picker(camera);
+        picker.onKey('s');
+        require(!picker.takeScreenshotRequest(), "No screenshot request before the first valid frame");
+        picker.onKey(0xffe1);
+        require(picker.colorSpace() == ColorSpace::Lab && !picker.statistics() &&
+                picker.selection().empty() && !picker.frozen(), "Switch mode without a selection");
+        cv::Mat image(120, 200, CV_8UC3, cv::Scalar(0, 255, 0));
+        image(cv::Rect(100, 0, 100, 120)).setTo(cv::Scalar(255, 0, 0));
+        picker.setFrame(image);
+        picker.onKey('S');
+        const auto liveScreenshot = picker.takeScreenshotRequest();
+        require(liveScreenshot && sameImage(*liveScreenshot, image) &&
+                !picker.frozen() && !picker.takeScreenshotRequest(), "Live screenshot is full-frame and consumed once");
+        const auto display = picker.imageRect();
+        picker.onMouse(cv::EVENT_LBUTTONDOWN, display.x + 10, display.y + 10, 0);
+        picker.onMouse(cv::EVENT_MOUSEMOVE, display.x + 80, display.y + 80, 0);
+        const auto selection = picker.selection();
+        picker.onKey(0xffe2);
+        require(picker.colorSpace() == ColorSpace::Hsv && picker.frozen() &&
+                picker.selection() == selection && picker.statistics()->range[0] == 60,
+                "Switch during dragging recomputes the same frozen ROI without ending the drag");
+        picker.onKey(0xffe1);
+        require(picker.statistics()->colorSpace == ColorSpace::Lab && picker.frozen() &&
+                picker.selection() == selection, "Switch back to Lab during dragging");
+        picker.onKey('s');
+        picker.onMouse(cv::EVENT_LBUTTONUP, display.x + 80, display.y + 80, 0);
+        require(!picker.frozen() && picker.takeReportRequest(), "Release resumes capture after switching");
+        picker.setFrame(cv::Mat(image.size(), CV_8UC3, cv::Scalar(0, 0, 255)));
+        const auto dragScreenshot = picker.takeScreenshotRequest();
+        require(dragScreenshot && sameImage(*dragScreenshot, image),
+                "Screenshot owns the selected displayed frame even after capture advances");
+        require(!picker.render().empty(), "Lab selected histograms render");
+        if (camera) {
+            picker.onKey(' ');
+            picker.onKey(0xffe2);
+            picker.onKey('S');
+            require(picker.frozen() && picker.selection() == selection && picker.takeScreenshotRequest(),
+                    "Switching and screenshot preserve a manual camera pause");
+        }
+        const auto beforeRepeatedSwitches = picker.colorSpace();
+        for (int i = 0; i < 10; ++i) {
+            picker.onKey(i % 2 == 0 ? 0xffe1 : 0xffe2);
+        }
+        require(picker.colorSpace() == beforeRepeatedSwitches && picker.selection() == selection,
+                "Repeated left/right Shift toggles retain ROI");
+        picker.onKey('r');
+        require(!picker.frozen() && !picker.statistics() && !picker.render().empty(),
+                "R clears/resumes correctly in either color space");
+        picker.setNotice("Screenshot saved");
+        require(!picker.render().empty(), "Screenshot success feedback renders");
+        picker.setNotice("Screenshot failed", true);
+        require(!picker.render().empty(), "Screenshot failure feedback renders");
+    }
+}
+
+struct TemporaryDirectory {
+    std::filesystem::path path;
+    TemporaryDirectory() {
+        char pattern[] = "/tmp/hsv-picker-tests-XXXXXX";
+        const auto* created = ::mkdtemp(pattern);
+        require(created != nullptr, "Create screenshot test directory");
+        path = created;
+    }
+    ~TemporaryDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+};
+
+void testScreenshotFiles() {
+    TemporaryDirectory temporary;
+    const auto directory = temporary.path / "nested" / "test images";
+    cv::Mat image(30, 50, CV_8UC3);
+    for (int y = 0; y < image.rows; ++y) {
+        for (int x = 0; x < image.cols; ++x) {
+            image.at<cv::Vec3b>(y, x) = cv::Vec3b(x * 4, y * 7, x + y);
+        }
+    }
+    const auto first = hsvpicker::saveScreenshot(image, directory.string());
+    require(static_cast<bool>(first), "Create directories and save the original frame as PNG: " + first.error);
+    require(std::filesystem::path(first.path).is_absolute() &&
+            std::filesystem::path(first.path).extension() == ".png", "Screenshot path and format");
+    require(sameImage(cv::imread(first.path), image), "PNG round trip preserves every pixel and original resolution");
+    const auto second = hsvpicker::saveScreenshot(image, directory.string());
+    const auto third = hsvpicker::saveScreenshot(image(cv::Rect(1, 2, 20, 10)), directory.string());
+    require(second && third && first.path != second.path && second.path != third.path,
+            "Consecutive saves use different filenames");
+    require(sameImage(cv::imread(first.path), image), "Subsequent saves do not overwrite an existing screenshot");
+    require(sameImage(cv::imread(third.path), image(cv::Rect(1, 2, 20, 10))),
+            "PNG encoder handles non-contiguous BGR input");
+    require(!hsvpicker::saveScreenshot(cv::Mat(), directory.string()) &&
+            !hsvpicker::saveScreenshot(cv::Mat(1, 1, CV_32FC3), directory.string()) &&
+            !hsvpicker::saveScreenshot(image, ""), "Invalid screenshots return failure without throwing");
+    const auto blocker = temporary.path / "regular-file";
+    std::ofstream(blocker) << "keep this file";
+    const auto failure = hsvpicker::saveScreenshot(image, (blocker / "subdirectory").string());
+    require(!failure && !failure.error.empty(), "Invalid output directory reports a nonfatal filesystem error");
+    require(static_cast<bool>(hsvpicker::saveScreenshot(image, directory.string())),
+            "A successful save is still possible after an earlier failure");
 }
 
 void testPicker(const std::string& previewPath) {
@@ -213,9 +469,14 @@ int main(int argc, char** argv) {
     try {
         testOptions();
         testStatistics();
+        testLabStatistics();
+        testFullKeyCodes();
+        testSwitchingAndScreenshots();
+        testScreenshotFiles();
         testCoordinates();
+        testHistogramHover();
         testPicker(argc > 1 ? argv[1] : "");
-        std::cout << "All HSV statistics, coordinates, options, and interaction checks passed.\n";
+        std::cout << "All HSV/Lab statistics, keyboard, screenshot, coordinates, and interaction checks passed.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Test failed: " << error.what() << '\n';
