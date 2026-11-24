@@ -6,12 +6,13 @@
 #include <opencv2/videoio.hpp>
 #include <opencv2/core/version.hpp>
 
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 
 namespace {
-constexpr const char* windowName = "HSV Picker";
+constexpr const char* windowName = "color-picker";
 
 void mouseCallback(int event, int x, int y, int flags, void* userData) {
     static_cast<hsvpicker::Picker*>(userData)->onMouse(event, x, y, flags);
@@ -38,7 +39,59 @@ void printSelection(const hsvpicker::Picker& picker) {
 
 class WindowMonitor {
 public:
-    explicit WindowMonitor(bool checkProperties) : checkProperties_(checkProperties) {}
+    explicit WindowMonitor(const std::string& backend)
+        : checkProperties_(backend != "WAYLAND"), checkSize_(checkProperties_),
+          probeRatio_(backend.empty() || backend == "QT"),
+          checkWidgetRatio_(backend.empty() || backend.rfind("GTK", 0) == 0) {}
+
+    void updateLayout(hsvpicker::Picker& picker) {
+        if (!checkSize_) {
+            return;
+        }
+        cv::Size size;
+        try {
+            size = cv::getWindowImageRect(windowName).size();
+        } catch (const cv::Exception&) {
+            checkSize_ = false;
+            return;
+        }
+        if (size.empty()) {
+            return;
+        }
+        // On Qt the image rect excludes letterboxing. Once a size query
+        // succeeds, let the composed canvas use the entire client area.
+        // Older builds have no backend name; Qt returns the ratio mode here,
+        // while GTK returns the actual width/height ratio.
+        if (probeRatio_) {
+            probeRatio_ = false;
+            try {
+                if (cv::getWindowProperty(windowName, cv::WND_PROP_ASPECT_RATIO) == cv::WINDOW_KEEPRATIO) {
+                    cv::setWindowProperty(windowName, cv::WND_PROP_ASPECT_RATIO, cv::WINDOW_FREERATIO);
+                    checkWidgetRatio_ = false;
+                    return;
+                }
+            } catch (const cv::Exception&) {
+                // Backends without ratio control retain uniform display scaling.
+            }
+        }
+        // GTK reports the fitted image, while its aspect property describes
+        // the whole widget. Recover the space occupied by the letterbox bars.
+        if (checkWidgetRatio_) {
+            try {
+                const double ratio = cv::getWindowProperty(windowName, cv::WND_PROP_ASPECT_RATIO);
+                if (std::isfinite(ratio) && ratio > 0 && ratio != cv::WINDOW_FREERATIO) {
+                    if (size.width < size.height * ratio) {
+                        size.width = cvRound(size.height * ratio);
+                    } else {
+                        size.height = cvRound(size.width / ratio);
+                    }
+                }
+            } catch (const cv::Exception&) {
+                checkWidgetRatio_ = false;
+            }
+        }
+        picker.setCanvasSize(size);
+    }
 
     bool isOpen() {
         if (!checkProperties_) {
@@ -76,6 +129,9 @@ public:
 
 private:
     bool checkProperties_;
+    bool checkSize_;
+    bool probeRatio_;
+    bool checkWidgetRatio_;
     bool visibilitySupported_ = false;
     bool autosizeSupported_ = false;
 };
@@ -89,12 +145,12 @@ int main(int argc, char** argv) {
         }
         const auto options = hsvpicker::parseOptions(arguments);
         if (options.help) {
-            std::cout << "Usage: hsv-picker [--source DEVICE_OR_IMAGE] [--screenshot-dir DIR]\n"
+            std::cout << "Usage: color-picker [--source DEVICE_OR_IMAGE] [--screenshot-dir DIR]\n"
                       << "Default source: /dev/video0\n"
                       << "Default screenshot directory: ./screenshots (PNG, full original BGR frame)\n"
                       << "Examples:\n"
-                      << "  hsv-picker --source /dev/video2\n"
-                      << "  hsv-picker --source ./image.png\n"
+                      << "  color-picker --source /dev/video2\n"
+                      << "  color-picker --source ./image.png\n"
                       << "Controls: drag left mouse to select; Space freezes/resumes camera;\n"
                       << "          Shift switches HSV/Lab; S saves a screenshot;\n"
                       << "          R clears/resumes; P prints OpenCV bounds; Q/Esc quits.\n"
@@ -132,21 +188,22 @@ int main(int argc, char** argv) {
         cv::imshow(windowName, picker.render());
         // Request the initial size after assigning the image, so the backend
         // does not replace it with its small default window dimensions.
-        cv::resizeWindow(windowName, 1440, 880);
+        const auto initial = picker.layout().canvas;
+        cv::resizeWindow(windowName, initial.width, initial.height);
         cv::setMouseCallback(windowName, mouseCallback, &picker);
-        bool checkProperties = true;
+        std::string backend;
 #ifdef HSV_HAS_UI_FRAMEWORK
         // The native Wayland backend does not implement getWindowProperty.
-        const auto backend = cv::currentUIFramework();
-        checkProperties = backend != "WAYLAND";
+        backend = cv::currentUIFramework();
         std::cout << "HighGUI backend: " << backend << '\n';
 #endif
-        WindowMonitor windowMonitor(checkProperties);
+        WindowMonitor windowMonitor(backend);
         std::cout << "Drag left mouse to select. Camera freezes during dragging and resumes on release.\n"
                   << "Shift: HSV/Lab; S: save original frame to " << options.screenshotDir << '\n'
                   << "Release the mouse or press P to print OpenCV 8-bit bounds.\n"
                   << std::flush;
         while (true) {
+            windowMonitor.updateLayout(picker);
             cv::imshow(windowName, picker.render());
             const int key = cv::waitKeyEx(20);
             if (!windowMonitor.isOpen() || !picker.onKey(key)) {
@@ -176,7 +233,7 @@ int main(int argc, char** argv) {
         cv::destroyAllWindows();
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
-        std::cerr << "hsv-picker: " << error.what() << '\n';
+        std::cerr << "color-picker: " << error.what() << '\n';
         return EXIT_FAILURE;
     }
 }

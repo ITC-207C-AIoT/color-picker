@@ -15,16 +15,53 @@ const cv::Scalar panel(38, 35, 32);
 const cv::Scalar ink(240, 237, 231);
 const cv::Scalar muted(168, 164, 157);
 const cv::Scalar accent(126, 220, 108);
-const cv::Rect viewport(16, 88, 720, 570);
+constexpr int margin = 12;
+constexpr int panelWidth = 384;
+constexpr int preferredPanelHeight = 490;
+constexpr int headerHeight = 62;
 
-struct HistogramLayout {
-    int top;
-    cv::Rect plot; // Includes the baseline; bars occupy the rows above it.
-};
+int footerHeight(int width) {
+    return width < 700 ? 72 : 52;
+}
 
-HistogramLayout histogramLayout(int channel) {
-    const int top = 259 + channel * 127;
-    return {top, cv::Rect(766, top + 26, 390, 75)};
+cv::Size initialCanvas(cv::Size frame) {
+    const int width = frame.width + panelWidth + 3 * margin;
+    return {width, headerHeight + std::max(frame.height, preferredPanelHeight) + footerHeight(width)};
+}
+
+PickerLayout makeLayout(cv::Size canvas, cv::Size frame) {
+    PickerLayout layout{};
+    layout.canvas = canvas;
+    const int body = canvas.height - headerHeight - footerHeight(canvas.width);
+    const int innerWidth = canvas.width - 2 * margin;
+    if (innerWidth >= panelWidth + margin + std::min(256, frame.width)) {
+        layout.viewport = {margin, headerHeight, innerWidth - panelWidth - margin, body};
+        layout.panel = {layout.viewport.br().x + margin, headerHeight, panelWidth, body};
+    } else {
+        const int available = body - margin;
+        // Give the preview its full width when that leaves room for the charts.
+        const int previewHeight = frame.empty() ? available / 2 :
+                                  fitImage(frame, {0, 0, innerWidth, available}).height;
+        const int panelHeight = std::clamp(available - previewHeight, std::min(320, available / 2),
+                                           std::min(preferredPanelHeight, available * 2 / 3));
+        layout.viewport = {margin, headerHeight, innerWidth, available - panelHeight};
+        layout.panel = {margin, layout.viewport.br().y + margin, innerWidth, panelHeight};
+    }
+    if (!frame.empty()) {
+        layout.image = fitImage(frame, layout.viewport);
+    }
+
+    const auto& panel = layout.panel;
+    layout.panelScale = std::min({1.0, panel.width / 360.0, panel.height / 405.0});
+    const double scale = layout.panelScale;
+    const int inset = cvRound(12 * scale);
+    const int chartTop = panel.y + cvRound(140 * scale);
+    const int rowHeight = (panel.br().y - inset - chartTop) / 3;
+    for (int i = 0; i < 3; ++i) {
+        layout.plots[i] = {panel.x + inset, chartTop + i * rowHeight + cvRound(20 * scale),
+                           panel.width - 2 * inset, rowHeight - cvRound(41 * scale)};
+    }
+    return layout;
 }
 
 int histogramBins(ColorSpace space, int channel) {
@@ -35,20 +72,25 @@ int histogramValueAtX(const cv::Rect& plot, int bins, int x) {
     const int offset = std::clamp(x - plot.x, 0, plot.width - 1);
     // Inverse of bar edges floor(bin * width / bins). Using floor(x*bins/width)
     // would report the preceding bin at some boundaries with unequal bar widths.
-    return ((offset + 1) * bins - 1) / plot.width;
+    return static_cast<int>((static_cast<std::int64_t>(offset + 1) * bins - 1) / plot.width);
 }
 
 void text(cv::Mat& canvas, const std::string& value, int x, int y,
           double scale = 0.48, cv::Scalar color = ink) {
+    int baseline = 0;
+    const auto width = cv::getTextSize(value, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline).width;
+    if (width > canvas.cols - x - margin) {
+        scale *= static_cast<double>(canvas.cols - x - margin) / width;
+    }
     cv::putText(canvas, value, cv::Point(x, y), cv::FONT_HERSHEY_SIMPLEX,
                 scale, color, 1, cv::LINE_AA);
 }
 
 void histogram(cv::Mat& canvas, const ColorStatistics* stats, ColorSpace space,
-               int channel) {
-    const auto layout = histogramLayout(channel);
-    const int top = layout.top;
-    const auto& plot = layout.plot;
+               int channel, const PickerLayout& layout) {
+    const auto& plot = layout.plots[channel];
+    const double scale = layout.panelScale;
+    const int labelY = plot.y - cvRound(6 * scale);
     const int left = plot.x;
     const int width = plot.width;
     const int height = plot.height - 1;
@@ -60,7 +102,7 @@ void histogram(cv::Mat& canvas, const ColorStatistics* stats, ColorSpace space,
     const cv::Scalar colors[] = {cv::Scalar(110, 185, 230),
                                  cv::Scalar(215, 160, 110),
                                  cv::Scalar(130, 220, 140)};
-    text(canvas, names[channel], left, top + 14, 0.48, colors[channel]);
+    text(canvas, names[channel], left, labelY, 0.48 * scale, colors[channel]);
     std::uint64_t peak = 0;
     if (stats) {
         const auto& counts = stats->histograms[channel];
@@ -71,8 +113,8 @@ void histogram(cv::Mat& canvas, const ColorStatistics* stats, ColorSpace space,
             }
             const int barHeight = std::max(1, static_cast<int>(std::lround(
                 static_cast<double>(counts[bin]) / static_cast<double>(peak) * height)));
-            const int x1 = left + bin * width / bins;
-            const int x2 = left + (bin + 1) * width / bins - 1;
+            const int x1 = left + static_cast<int>(static_cast<std::int64_t>(bin) * width / bins);
+            const int x2 = left + static_cast<int>(static_cast<std::int64_t>(bin + 1) * width / bins) - 1;
             cv::Scalar color = colors[channel];
             if (space == ColorSpace::Hsv && channel == 0) {
                 cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(bin, 220, 240));
@@ -85,19 +127,20 @@ void histogram(cv::Mat& canvas, const ColorStatistics* stats, ColorSpace space,
                           cv::Point(x2, bottom - 1), color, cv::FILLED);
         }
     }
-    text(canvas, "peak count: " + std::to_string(peak), left + 188, top + 14, 0.40, muted);
+    text(canvas, "peak count: " + std::to_string(peak), left + width / 2, labelY, 0.40 * scale, muted);
     cv::line(canvas, {left, bottom}, {left + width - 1, bottom}, muted);
     for (int tick : {left, left + width / 2, left + width - 1}) {
         const std::string label = std::to_string(histogramValueAtX(plot, bins, tick));
         int baseline = 0;
-        const auto size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.40, 1, &baseline);
+        const auto size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.40 * scale, 1, &baseline);
         const int x = std::clamp(tick - size.width / 2, left, left + width - size.width);
-        text(canvas, label, x, bottom + 17, 0.40, muted);
+        text(canvas, label, x, bottom + cvRound(16 * scale), 0.40 * scale, muted);
     }
 }
 
-void histogramTooltip(cv::Mat& canvas, const HistogramHover& hover, ColorSpace space) {
-    const auto plot = histogramLayout(hover.channel).plot;
+void histogramTooltip(cv::Mat& canvas, const HistogramHover& hover, ColorSpace space,
+                      const PickerLayout& layout) {
+    const auto& plot = layout.plots[hover.channel];
     cv::line(canvas, {hover.position.x, plot.y},
              {hover.position.x, plot.y + plot.height - 1}, accent);
 
@@ -105,14 +148,17 @@ void histogramTooltip(cv::Mat& canvas, const HistogramHover& hover, ColorSpace s
     const char* labNames[] = {"L", "a", "b"};
     const auto* names = space == ColorSpace::Hsv ? hsvNames : labNames;
     const std::string label = std::string(names[hover.channel]) + " = " + std::to_string(hover.value);
-    constexpr int padding = 6;
-    constexpr int gap = 12;
-    constexpr int margin = 2;
-    constexpr double scale = 0.48;
+    const int padding = cvRound(5 * layout.panelScale);
+    const int gap = cvRound(10 * layout.panelScale);
+    const double scale = 0.48 * layout.panelScale;
     int baseline = 0;
     const auto size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline);
     const int width = size.width + padding * 2;
     const int height = size.height + baseline + padding * 2;
+    if (width > plot.width || height > plot.height) {
+        return;
+    }
+    const int margin = std::min({2, (plot.width - width) / 2, (plot.height - height) / 2});
     int x = hover.position.x + gap;
     int y = hover.position.y + gap;
     if (x + width > plot.br().x - margin) {
@@ -281,19 +327,49 @@ cv::Rect sourceSelection(cv::Point first, cv::Point last,
             vertical.second - vertical.first};
 }
 
-Picker::Picker(bool camera) : camera_(camera) {}
+Picker::Picker(bool camera)
+    : camera_(camera), layout_(makeLayout(initialCanvas({1, 1}), {})),
+      canvasOnOutput_(cv::Point(), layout_.canvas), outputSize_(layout_.canvas) {}
+
+void Picker::setCanvasSize(cv::Size available) {
+    if (available.empty() || available == outputSize_) {
+        return;
+    }
+    // Fit a compact logical layout uniformly when the window is too small
+    // for the plots and text, even on backends whose canvas fills the window.
+    const cv::Size canvas(std::max(320, available.width), std::max(360, available.height));
+    layout_ = makeLayout(canvas, frame_.size());
+    outputSize_ = available;
+    canvasOnOutput_ = fitImage(canvas, cv::Rect(cv::Point(), available));
+    mousePosition_.reset();
+}
+
+cv::Rect Picker::imageRect() const {
+    if (outputSize_ == layout_.canvas) {
+        return layout_.image;
+    }
+    const double scaleX = static_cast<double>(canvasOnOutput_.width) / layout_.canvas.width;
+    const double scaleY = static_cast<double>(canvasOnOutput_.height) / layout_.canvas.height;
+    const auto project = [&](cv::Point p) {
+        return canvasOnOutput_.tl() + cv::Point(cvRound(p.x * scaleX), cvRound(p.y * scaleY));
+    };
+    return {project(layout_.image.tl()), project(layout_.image.br())};
+}
 
 void Picker::setFrame(const cv::Mat& bgr) {
     if (bgr.empty() || bgr.type() != CV_8UC3) {
         throw std::invalid_argument("Source must provide a nonempty 8-bit BGR image");
     }
     if (bgr.size() != frame_.size()) {
+        if (frame_.empty()) {
+            setCanvasSize(initialCanvas(bgr.size()));
+        }
+        layout_ = makeLayout(layout_.canvas, bgr.size());
         selection_ = {};
         statistics_.reset();
         dragging_ = false;
     }
-    frame_ = bgr.clone();
-    imageRect_ = fitImage(frame_.size(), viewport);
+    bgr.copyTo(frame_);
     refreshStatistics();
 }
 
@@ -306,20 +382,34 @@ void Picker::refreshStatistics() {
 }
 
 void Picker::selectTo(cv::Point point) {
-    selection_ = sourceSelection(anchor_, point, imageRect_, frame_.size());
-    refreshStatistics();
+    const auto image = imageRect();
+    if (!image.empty()) {
+        selection_ = anchorPixels_ | sourceSelection(point, point, image, frame_.size());
+        refreshStatistics();
+    }
 }
 
 void Picker::onMouse(int event, int x, int y, int /*flags*/) {
     const cv::Point point(x, y);
     mousePosition_ = point;
+    if (outputSize_ != layout_.canvas) {
+        mousePosition_.reset();
+        if (canvasOnOutput_.contains(point)) {
+            const auto offset = point - canvasOnOutput_.tl();
+            mousePosition_ = cv::Point(
+                static_cast<int>((offset.x + 0.5) * layout_.canvas.width / canvasOnOutput_.width),
+                static_cast<int>((offset.y + 0.5) * layout_.canvas.height / canvasOnOutput_.height));
+        }
+    }
     if (frame_.empty()) {
         return;
     }
-    if (event == cv::EVENT_LBUTTONDOWN && imageRect_.contains(point)) {
-        anchor_ = point;
+    const auto image = imageRect();
+    if (event == cv::EVENT_LBUTTONDOWN && image.contains(point)) {
+        anchorPixels_ = sourceSelection(point, point, image, frame_.size());
+        selection_ = anchorPixels_;
         dragging_ = true;
-        selectTo(point);
+        refreshStatistics();
     } else if (dragging_ && event == cv::EVENT_LBUTTONUP) {
         selectTo(point);
         dragging_ = false;
@@ -336,7 +426,7 @@ std::optional<HistogramHover> Picker::histogramHover() const {
         return std::nullopt;
     }
     for (int channel = 0; channel < 3; ++channel) {
-        const auto plot = histogramLayout(channel).plot;
+        const auto& plot = layout_.plots[channel];
         if (plot.contains(*mousePosition_)) {
             return HistogramHover{channel, histogramValueAtX(plot, histogramBins(colorSpace_, channel),
                                                            mousePosition_->x), *mousePosition_};
@@ -388,65 +478,85 @@ void Picker::setNotice(const std::string& message, bool error) {
 }
 
 cv::Mat Picker::render() const {
-    cv::Mat canvas(canvasHeight, canvasWidth, CV_8UC3, background);
-    text(canvas, std::string(colorSpaceName(colorSpace_)) + " PICKER", 16, 32, 0.82, accent);
+    cv::Mat canvas(layout_.canvas, CV_8UC3, background);
+    text(canvas, "color-picker", margin, 28, 0.78, accent);
     const std::string status = camera_ ? (frozen() ? "CAMERA / FROZEN" : "CAMERA / LIVE") : "IMAGE";
-    text(canvas, status, 560, 32, 0.48, accent);
+    text(canvas, std::string(colorSpaceName(colorSpace_)) + "  |  " + status, 168, 27, 0.46, accent);
     if (std::chrono::steady_clock::now() < noticeUntil_) {
-        text(canvas, notice_, 16, 61, 0.48, noticeError_ ? cv::Scalar(100, 100, 255) : accent);
+        text(canvas, notice_, margin, 51, 0.46, noticeError_ ? cv::Scalar(100, 100, 255) : accent);
     } else {
-        text(canvas, "Drag left mouse to select. Values use OpenCV 8-bit " +
-             std::string(colorSpaceName(colorSpace_)) + ".", 16, 61, 0.48, muted);
+        text(canvas, "Drag to select. Values use original 8-bit pixels.", margin, 51, 0.46, muted);
     }
-    cv::rectangle(canvas, viewport, panel, cv::FILLED);
-    cv::rectangle(canvas, cv::Rect(750, 88, 414, 570), panel, cv::FILLED);
+    cv::rectangle(canvas, layout_.viewport, panel, cv::FILLED);
+    cv::rectangle(canvas, layout_.panel, panel, cv::FILLED);
 
+    const auto& image = layout_.image;
     if (!frame_.empty()) {
-        cv::Mat resized;
-        cv::resize(frame_, resized, imageRect_.size(), 0, 0,
-                   imageRect_.width < frame_.cols ? cv::INTER_AREA : cv::INTER_NEAREST);
-        resized.copyTo(canvas(imageRect_));
+        auto preview = canvas(image);
+        if (image.size() == frame_.size()) {
+            frame_.copyTo(preview);
+        } else {
+            cv::resize(frame_, preview, image.size(), 0, 0,
+                       image.width < frame_.cols ? cv::INTER_AREA : cv::INTER_NEAREST);
+        }
         if (!selection_.empty()) {
-            const int x1 = imageRect_.x + static_cast<int>(
-                static_cast<std::int64_t>(selection_.x) * imageRect_.width / frame_.cols);
-            const int y1 = imageRect_.y + static_cast<int>(
-                static_cast<std::int64_t>(selection_.y) * imageRect_.height / frame_.rows);
-            const int x2 = imageRect_.x + static_cast<int>((
-                static_cast<std::int64_t>(selection_.x + selection_.width) * imageRect_.width
+            const int x1 = image.x + static_cast<int>(
+                static_cast<std::int64_t>(selection_.x) * image.width / frame_.cols);
+            const int y1 = image.y + static_cast<int>(
+                static_cast<std::int64_t>(selection_.y) * image.height / frame_.rows);
+            const int x2 = image.x + static_cast<int>((
+                static_cast<std::int64_t>(selection_.x + selection_.width) * image.width
                 + frame_.cols - 1) / frame_.cols) - 1;
-            const int y2 = imageRect_.y + static_cast<int>((
-                static_cast<std::int64_t>(selection_.y + selection_.height) * imageRect_.height
+            const int y2 = image.y + static_cast<int>((
+                static_cast<std::int64_t>(selection_.y + selection_.height) * image.height
                 + frame_.rows - 1) / frame_.rows) - 1;
             cv::rectangle(canvas, {x1, y1}, {x2, y2}, cv::Scalar(0, 0, 0), 3);
             cv::rectangle(canvas, {x1, y1}, {x2, y2}, accent, 1);
         }
     }
 
-    text(canvas, rangeLabel(colorSpace_), 766, 112, 0.43, muted);
+    const double scale = layout_.panelScale;
+    const auto panelText = [&](const std::string& label, int y, double fontSize, cv::Scalar color) {
+        text(canvas, label, layout_.plots[0].x, layout_.panel.y + cvRound(y * scale),
+             fontSize * scale, color);
+    };
     const auto* stats = statistics_ ? &*statistics_ : nullptr;
-    text(canvas, stats ? rangeText(*stats) : "Select an image region", 766, 141, 0.64, accent);
-    text(canvas, colorSpace_ == ColorSpace::Hsv ? "Inclusive min / max. H: 0..179, S/V: 0..255" :
-         "Inclusive min / max. L/a/b: 0..255 (8-bit)", 766, 164, 0.40, muted);
-    text(canvas, stats ? "lower = " + scalarText(*stats, false) : "lower = --", 766, 190, 0.46);
-    text(canvas, stats ? "upper = " + scalarText(*stats, true) : "upper = --", 766, 214, 0.46);
-    text(canvas, "Histograms: x = value (hover), y = pixel count", 766, 244, 0.41, muted);
+    panelText(rangeLabel(colorSpace_), 20, 0.43, muted);
+    panelText(stats ? rangeText(*stats) : "Select an image region", 46, 0.64, accent);
+    panelText(colorSpace_ == ColorSpace::Hsv ? "Inclusive min / max. H: 0..179, S/V: 0..255" :
+              "Inclusive min / max. L/a/b: 0..255 (8-bit)", 66, 0.40, muted);
+    panelText(stats ? "lower = " + scalarText(*stats, false) : "lower = --", 90, 0.46, ink);
+    panelText(stats ? "upper = " + scalarText(*stats, true) : "upper = --", 111, 0.46, ink);
+    panelText("Histograms: x = value (hover), y = pixel count", 134, 0.41, muted);
     for (int channel = 0; channel < 3; ++channel) {
-        histogram(canvas, stats, colorSpace_, channel);
+        histogram(canvas, stats, colorSpace_, channel, layout_);
     }
     if (const auto hover = histogramHover()) {
-        histogramTooltip(canvas, *hover, colorSpace_);
+        histogramTooltip(canvas, *hover, colorSpace_, layout_);
     }
 
+    const int footer = layout_.panel.br().y;
     if (stats) {
         text(canvas, "ROI: x=" + std::to_string(selection_.x) + " y=" + std::to_string(selection_.y) +
              " w=" + std::to_string(selection_.width) + " h=" + std::to_string(selection_.height) +
-             " | pixels=" + std::to_string(stats->pixels), 16, 681, 0.45, muted);
+             " | pixels=" + std::to_string(stats->pixels), margin, footer + 20, 0.45, muted);
     } else {
-        text(canvas, "No selection | Statistics are computed from original pixels.", 16, 681, 0.45, muted);
+        text(canvas, "No selection", margin, footer + 20, 0.45, muted);
     }
-    text(canvas, "Shift: HSV/Lab   S: screenshot   Space: freeze/resume   R: clear/resume   P: print   Q/Esc: quit",
-         16, 706, 0.44, muted);
-    return canvas;
+    const std::string firstKeys = "Shift: HSV/Lab   S: screenshot   Space: freeze/resume";
+    const std::string lastKeys = "R: clear/resume   P: print   Q/Esc: quit";
+    if (canvas.cols < 700) {
+        text(canvas, firstKeys, margin, footer + 40, 0.44, muted);
+        text(canvas, lastKeys, margin, footer + 60, 0.44, muted);
+    } else {
+        text(canvas, firstKeys + "   " + lastKeys, margin, footer + 41, 0.44, muted);
+    }
+    if (canvas.size() == outputSize_) {
+        return canvas;
+    }
+    cv::Mat output(outputSize_, canvas.type(), background);
+    cv::resize(canvas, output(canvasOnOutput_), canvasOnOutput_.size(), 0, 0, cv::INTER_AREA);
+    return output;
 }
 
 } // namespace hsvpicker

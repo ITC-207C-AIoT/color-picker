@@ -5,6 +5,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -125,6 +126,69 @@ bool sameImage(const cv::Mat& a, const cv::Mat& b) {
            cv::norm(a, b, cv::NORM_INF) == 0;
 }
 
+void testAdaptiveLayout() {
+    for (const auto size : {cv::Size(1280, 720), cv::Size(360, 640), cv::Size(1537, 191)}) {
+        cv::Mat original(size, CV_8UC3);
+        cv::RNG(1234).fill(original, cv::RNG::UNIFORM, 0, 256);
+        hsvpicker::Picker picker(true);
+        picker.setFrame(original);
+        require(sameImage(picker.render()(picker.imageRect()), original),
+                "The first frame has a pixel-for-pixel preview at the requested window size");
+
+        for (const auto window : {cv::Size(1024, 600), cv::Size(480, 800), cv::Size(320, 360)}) {
+            picker.setCanvasSize(window);
+            const auto& layout = picker.layout();
+            const auto preview = layout.image;
+            const auto canvas = picker.render();
+            require(canvas.size() == window && (preview & layout.viewport) == preview &&
+                    (layout.panel & layout.viewport).empty(), "Preview and statistics have separate space");
+            require(window.width >= 1024 ? layout.panel.x >= layout.viewport.br().x :
+                                          layout.panel.y >= layout.viewport.br().y,
+                    "The statistics panel moves below the preview in narrow windows");
+            require(std::abs(preview.width * size.height - preview.height * size.width) <=
+                    std::max(size.width, size.height), "Preview keeps the source aspect within pixel rounding");
+            cv::Mat expected;
+            cv::resize(original, expected, preview.size(), 0, 0,
+                       preview.width < size.width ? cv::INTER_AREA : cv::INTER_NEAREST);
+            require(sameImage(canvas(preview), expected), "Resizing includes the entire source frame");
+            for (int channel = 0; channel < 3; ++channel) {
+                const auto plot = layout.plots[channel];
+                require((plot & layout.panel) == plot, "Each plot fits its current panel");
+                picker.onMouse(cv::EVENT_MOUSEMOVE, plot.br().x - 1, plot.br().y - 1, 0);
+                const auto hover = picker.histogramHover();
+                require(hover && hover->channel == channel && hover->value == (channel == 0 ? 179 : 255) &&
+                        !picker.render().empty(), "Hover follows each resized plot to its last bin");
+            }
+        }
+
+        const auto small = picker.imageRect();
+        const auto start = small.tl() + cv::Point(small.width / 2, small.height / 2);
+        picker.onMouse(cv::EVENT_LBUTTONDOWN, start.x, start.y, 0);
+        const auto anchor = picker.selection();
+        picker.setCanvasSize({1100, 720});
+        const auto end = picker.imageRect().br() - cv::Point(1, 1);
+        picker.onMouse(cv::EVENT_LBUTTONUP, end.x, end.y, 0);
+        require(picker.selection() == cv::Rect(anchor.tl(), cv::Point(size.width, size.height)),
+                "A drag across a layout change retains its original source anchor");
+        picker.onMouse(cv::EVENT_LBUTTONDOWN, end.x, end.y, 0);
+        picker.setCanvasSize({480, 800});
+        const auto top = picker.imageRect().tl();
+        picker.onMouse(cv::EVENT_LBUTTONUP, top.x, top.y, 0);
+        require(picker.statistics()->pixels == original.total(), "Reverse drag includes all four corners");
+        picker.onKey('s');
+        const auto shot = picker.takeScreenshotRequest();
+        require(shot && sameImage(*shot, original), "A resized preview still saves the full original");
+
+        picker.setCanvasSize({190, 220});
+        const auto compact = picker.imageRect();
+        require(picker.render().size() == cv::Size(190, 220) && !compact.empty(),
+                "A tiny drawable gets a uniformly fitted compact layout");
+        picker.onMouse(cv::EVENT_LBUTTONDOWN, compact.x, compact.y, 0);
+        picker.onMouse(cv::EVENT_LBUTTONUP, compact.br().x - 1, compact.br().y - 1, 0);
+        require(picker.statistics()->pixels == original.total(), "Compact preview edges map to all source pixels");
+    }
+}
+
 void testHistogramHover() {
     using hsvpicker::ColorSpace;
     hsvpicker::Picker picker(true);
@@ -134,7 +198,7 @@ void testHistogramHover() {
     for (const auto space : {ColorSpace::Hsv, ColorSpace::Lab}) {
         if (picker.colorSpace() != space) picker.onKey(0xffe1);
         for (int channel = 0; channel < 3; ++channel) {
-            const cv::Rect plot(766, 285 + channel * 127, 390, 75);
+            const auto plot = picker.layout().plots[channel];
             const int bins = space == ColorSpace::Hsv && channel == 0 ? 180 : 256;
             for (int value = 0; value < bins; ++value) {
                 const int first = plot.x + value * plot.width / bins;
@@ -169,12 +233,15 @@ void testHistogramHover() {
     require(!picker.statistics() && picker.selection().empty() && !picker.frozen() &&
             !picker.takeReportRequest() && !picker.takeScreenshotRequest(),
             "Hover works without ROI statistics and does not change camera or report state");
-    for (const auto point : {cv::Point(765, 300), cv::Point(1156, 300), cv::Point(961, 284),
-                            cv::Point(961, 360), cv::Point(-1, -1), cv::Point(2000, 1000)}) {
+    const auto firstPlot = picker.layout().plots[0];
+    const auto middle = firstPlot.tl() + cv::Point(firstPlot.width / 2, firstPlot.height / 2);
+    for (const auto point : {cv::Point(firstPlot.x - 1, middle.y), cv::Point(firstPlot.br().x, middle.y),
+                            cv::Point(middle.x, firstPlot.y - 1), cv::Point(middle.x, firstPlot.br().y),
+                            cv::Point(-1, -1), cv::Point(2000, 1000)}) {
         picker.onMouse(cv::EVENT_MOUSEMOVE, point.x, point.y, 0);
         require(!picker.histogramHover(), "Moving outside a plot hides its hover");
     }
-    picker.onMouse(cv::EVENT_MOUSEMOVE, 961, 300, 0);
+    picker.onMouse(cv::EVENT_MOUSEMOVE, middle.x, middle.y, 0);
     require(picker.histogramHover()->value == 128, "Lab midpoint is encoded value 128");
     picker.onKey(0xffe1);
     require(picker.histogramHover()->channel == 0 && picker.histogramHover()->value == 90,
@@ -182,14 +249,15 @@ void testHistogramHover() {
 
     const auto display = picker.imageRect();
     picker.onMouse(cv::EVENT_LBUTTONDOWN, display.x + 10, display.y + 10, 0);
-    picker.onMouse(cv::EVENT_MOUSEMOVE, 961, 300, 0);
+    picker.onMouse(cv::EVENT_MOUSEMOVE, middle.x, middle.y, 0);
     require(picker.frozen() && !picker.histogramHover(), "Dragging across a plot does not display a tooltip");
-    picker.onMouse(cv::EVENT_LBUTTONUP, 961, 300, 0);
+    picker.onMouse(cv::EVENT_LBUTTONUP, middle.x, middle.y, 0);
     require(picker.takeReportRequest() && picker.histogramHover() && !picker.frozen(),
             "Release ends dragging normally and re-enables hover");
     const auto selection = picker.selection();
     const auto range = picker.statistics()->range;
-    picker.onMouse(cv::EVENT_MOUSEMOVE, 1155, 613, 0);
+    const auto last = picker.layout().plots[2].br() - cv::Point(1, 1);
+    picker.onMouse(cv::EVENT_MOUSEMOVE, last.x, last.y, 0);
     require(picker.selection() == selection && picker.statistics()->range == range &&
             !picker.takeReportRequest() && !picker.frozen(), "Hover preserves a completed ROI and its statistics");
     picker.onKey('s');
@@ -199,7 +267,7 @@ void testHistogramHover() {
     require(picker.histogramHover()->value == 255 && picker.statistics()->range[0] == 0 && !picker.frozen(),
             "Camera frames and selected ROI continue updating while hovering");
     picker.onKey(' ');
-    picker.onMouse(cv::EVENT_MOUSEMOVE, 961, 300, 0);
+    picker.onMouse(cv::EVENT_MOUSEMOVE, middle.x, middle.y, 0);
     require(picker.frozen() && picker.histogramHover(), "Hover preserves a manual camera pause");
 }
 
@@ -321,7 +389,7 @@ void testSwitchingAndScreenshots() {
 struct TemporaryDirectory {
     std::filesystem::path path;
     TemporaryDirectory() {
-        char pattern[] = "/tmp/hsv-picker-tests-XXXXXX";
+        char pattern[] = "/tmp/color-picker-tests-XXXXXX";
         const auto* created = ::mkdtemp(pattern);
         require(created != nullptr, "Create screenshot test directory");
         path = created;
@@ -455,7 +523,7 @@ void testPicker(const std::string& previewPath) {
     still.onKey(' ');
     require(!still.frozen(), "Space on an image is harmless");
     const auto canvas = still.render();
-    require(canvas.size() == cv::Size(hsvpicker::Picker::canvasWidth, hsvpicker::Picker::canvasHeight) &&
+    require(canvas.size() == still.layout().canvas &&
             canvas.type() == CV_8UC3, "Composed window image has expected format");
     if (!previewPath.empty()) {
         require(cv::imwrite(previewPath, canvas), "Write render preview");
@@ -474,6 +542,7 @@ int main(int argc, char** argv) {
         testSwitchingAndScreenshots();
         testScreenshotFiles();
         testCoordinates();
+        testAdaptiveLayout();
         testHistogramHover();
         testPicker(argc > 1 ? argv[1] : "");
         std::cout << "All HSV/Lab statistics, keyboard, screenshot, coordinates, and interaction checks passed.\n";

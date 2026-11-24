@@ -1,4 +1,4 @@
-# HSV / Lab 取色工具
+# color-picker · HSV / Lab 取色工具
 
 C++17 / OpenCV 4、5，使用 OpenCV HighGUI 显示一个窗口。输入支持 Linux
 `/dev/video*` 摄像头设备、`/dev/v4l/by-id/*` 设备链接和本地图片。
@@ -11,14 +11,13 @@ C++17 / OpenCV 4、5，使用 OpenCV HighGUI 显示一个窗口。输入支持 L
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure
 
-./build/hsv-picker                           # 默认 /dev/video0
-./build/hsv-picker --source /dev/video2
-./build/hsv-picker --source ./photo.png
-./build/hsv-picker --source="./my photo.jpg"
-./build/hsv-picker --source /dev/video0 --screenshot-dir ./test-images
-./build/hsv-picker --help
+./build/color-picker                           # 默认 /dev/video0
+./build/color-picker --source /dev/video2
+./build/color-picker --source ./photo.png
+./build/color-picker --source="./my photo.jpg"
+./build/color-picker --source /dev/video0 --screenshot-dir ./test-images
+./build/color-picker --help
 ```
 
 如果安装了多个 OpenCV 版本，用 `-DOpenCV_DIR=...` 指定包含
@@ -27,7 +26,6 @@ ctest --test-dir build --output-on-failure
 ```sh
 cmake -S . -B build-4 -DOpenCV_DIR=/path/to/opencv4/lib/cmake/opencv4
 cmake --build build-4 -j
-ctest --test-dir build-4 --output-on-failure
 ```
 
 目标机器使用 OpenCV 4 时，请在目标机器构建，或使用匹配目标机器的 OpenCV 4
@@ -35,15 +33,15 @@ ctest --test-dir build-4 --output-on-failure
 
 ## 取色方式
 
-- 在左侧图像上按住鼠标左键并拖动，可以向任意方向框选；拖出图像边界会自动裁剪。
+- 在预览图像上按住鼠标左键并拖动，可以向任意方向框选；拖出图像边界会自动裁剪。
 - 框选由左键按下开始，左键抬起结束，不根据移动事件里的按键标志提前结束。如果在窗口外松开后选框仍未结束，按 `R` 取消。
 - 默认使用 HSV。按左、右任意一个 `Shift` 在 HSV / Lab 间切换，保留选区和暂停状态，并立即重新计算当前选区；拖动过程中也可以切换。
-- 拖动期间，右侧实时显示当前色彩空间三个通道的直方图和范围值；松开鼠标会把结果打印到终端。
+- 拖动期间，统计面板实时显示当前色彩空间三个通道的直方图和范围值；松开鼠标会把结果打印到终端。
 - 摄像头拖动框选期间冻结当前显示帧，松开鼠标后自动恢复实时采集，保留的选区会随实时画面重新统计。按 `Space` 可以手动冻结/恢复；手动冻结时框选结束后仍保持冻结。
 - `R` 取消框选、清除选区并恢复摄像头实时采集，`P` 再次打印当前范围，`Q` / `Esc` 退出。
 - `S` / `s` 保存当前整帧原始画面为 PNG，详见下方截图说明。所有快捷键需要程序窗口获得焦点。
-- 鼠标悬浮在右侧任一通道的绘图区或基线上，会出现跟随鼠标的通道值提示（如 `H = 120`、`a = 128`），并用竖线标记对应的横轴位置。数值只取决于横坐标，与柱高无关；零频数位置和未框选时也可查看。
-- 提示框会在图表边缘自动调整位置；鼠标移动到绘图区外时隐藏，拖动左侧选框期间不显示。按 `Shift` 切换 HSV / Lab 后，鼠标当前位置的提示同步更新。悬浮不会暂停摄像头、修改选区或影响原始帧截图。
+- 鼠标悬浮在任一通道的绘图区或基线上，会出现跟随鼠标的通道值提示（如 `H = 120`、`a = 128`），并用竖线标记对应的横轴位置。数值只取决于横坐标，与柱高无关；零频数位置和未框选时也可查看。
+- 提示框会在图表边缘自动调整位置；鼠标移动到绘图区外时隐藏，拖动选框期间不显示。按 `Shift` 切换 HSV / Lab 后，鼠标当前位置的提示同步更新。悬浮不会暂停摄像头、修改选区或影响原始帧截图。
 
 显示时保持图像比例，统计使用**原始分辨率的像素**，不使用缩放图像、选框线或界面文字。
 选框包含起点和终点；缩小显示时，一个显示像素覆盖的原图像素都会纳入统计。
@@ -101,10 +99,13 @@ cv::inRange(lab, lower, upper, mask);
 
 ## GNOME / XFCE
 
-窗口使用 HighGUI 标准接口，不依赖 GNOME 或 XFCE 特有 API。启动时请求 **1440 × 880**
-的窗口尺寸，支持拖动窗口边缘调整大小和最大化；桌面可能按屏幕可用空间调整尺寸。
-使用 `WINDOW_NORMAL` 和 `WINDOW_KEEPRATIO`，界面保持比例缩放，HighGUI 将鼠标坐标
-映射回界面图像坐标，框选仍按原图像素统计。不调用 Wayland 不支持的窗口位置、尺寸查询接口。
+启动窗口的预览区按摄像头实际返回的首帧或本地图片的解码尺寸分配。例如，1280 × 720
+的输入对应 1280 × 720 的初始预览，统计面板、标题和快捷键另占空间。桌面分配的空间
+较小时，完整画面等比缩小。可以自由拖动窗口边缘或最大化，统计面板在宽窗口靠右，
+在窄窗口移到预览下方。拖动中调整窗口也会保留原图上的框选起点。
+
+程序通过 HighGUI 获取可用绘图区并重新排版。特别小的窗口会等比缩放紧凑布局。
+原生 Wayland 等无法报告绘图区尺寸的后端对整个界面做等比缩放。
 OpenCV 的 GUI 后端必须可用；可选择 GTK、Qt 或原生 Wayland，XFCE 下通常使用 X11。
 参见 [OpenCV HighGUI 文档](https://docs.opencv.org/4.x/d7/dfc/group__highgui.html)。
 
@@ -119,7 +120,7 @@ Shift 键码，不将特殊键直接截成低 8 位，避免误触普通快捷�
 如果 GNOME 下 Qt 后端无法加载 Wayland 插件，可在支持 XWayland 的会话中运行：
 
 ```sh
-QT_QPA_PLATFORM=xcb ./build/hsv-picker --source ./photo.png
+QT_QPA_PLATFORM=xcb ./build/color-picker --source ./photo.png
 ```
 
 无法打开摄像头、读取图片或摄像头断流时，程序向标准错误输出原因并以非零状态退出。
@@ -128,7 +129,7 @@ QT_QPA_PLATFORM=xcb ./build/hsv-picker --source ./photo.png
 如果目标机器仍然启动失败，请在它的桌面终端内运行并保留完整输出：
 
 ```sh
-./build/hsv-picker
+./build/color-picker
 echo "exit code: $?"
 ```
 
@@ -139,6 +140,14 @@ echo "exit code: $?"
 
 ## 测试
 
+测试程序默认关闭。配置时显式启用 `BUILD_TEST` 后即可构建并运行测试：
+
+```sh
+cmake -S . -B build-test -DBUILD_TEST=1
+cmake --build build-test -j
+ctest --test-dir build-test --output-on-failure
+```
+
 `ctest` 不需要摄像头或显示服务器，覆盖已知颜色的 HSV/Lab 值、直方图频数、ROI 边界、
 反向拖动、缩放坐标映射、摄像头冻结/恢复、左右 Shift 和完整键码、截图时状态保留、
 PNG 逐像素一致性、连续保存、保存失败恢复、参数错误及输出值对 `inRange`
@@ -146,5 +155,5 @@ PNG 逐像素一致性、连续保存、保存失败恢复、参数错误及输�
 截图测试文件在 `/tmp` 下创建并自动清理。可额外生成一张实际界面渲染图：
 
 ```sh
-./build/hsv-picker-tests /tmp/hsv-picker-preview.png
+./build-test/color-picker-tests /tmp/color-picker-preview.png
 ```

@@ -51,16 +51,24 @@ cv::Rect sourceSelection(cv::Point first, cv::Point last,
 struct HistogramHover {
     int channel;
     int value;
-    cv::Point position; // Composed-image coordinates, as supplied by HighGUI.
+    cv::Point position; // Position on the logical canvas.
+};
+
+// Geometry on the logical canvas, before fitting it into a very small window.
+struct PickerLayout {
+    cv::Size canvas;
+    cv::Rect viewport;
+    cv::Rect image;
+    cv::Rect panel;
+    std::array<cv::Rect, 3> plots; // Include the histogram baselines.
+    double panelScale;
 };
 
 class Picker {
 public:
-    static constexpr int canvasWidth = 1180;
-    static constexpr int canvasHeight = 720;
-
     explicit Picker(bool camera);
     void setFrame(const cv::Mat& bgr);
+    void setCanvasSize(cv::Size available);
     void onMouse(int event, int x, int y, int flags);
     // Takes the full waitKeyEx code. Returns false on Q/Esc.
     bool onKey(int key);
@@ -71,7 +79,8 @@ public:
     void setNotice(const std::string& message, bool error = false);
     ColorSpace colorSpace() const { return colorSpace_; }
     std::optional<HistogramHover> histogramHover() const;
-    const cv::Rect& imageRect() const { return imageRect_; }
+    const PickerLayout& layout() const { return layout_; }
+    cv::Rect imageRect() const; // Preview in the image returned by render().
     const cv::Rect& selection() const { return selection_; }
     const std::optional<ColorStatistics>& statistics() const { return statistics_; }
 
@@ -88,10 +97,12 @@ private:
     std::string notice_;
     bool noticeError_ = false;
     std::chrono::steady_clock::time_point noticeUntil_{};
-    cv::Point anchor_;
+    cv::Rect anchorPixels_;
     std::optional<cv::Point> mousePosition_;
     cv::Mat frame_;
-    cv::Rect imageRect_;
+    PickerLayout layout_;
+    cv::Rect canvasOnOutput_;
+    cv::Size outputSize_;
     cv::Rect selection_;
     std::optional<ColorStatistics> statistics_;
 };
